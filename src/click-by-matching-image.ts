@@ -1,30 +1,57 @@
-import cv from '@u4/opencv4nodejs';
 import fs from 'fs';
+import {PNG} from 'pngjs';
+import pixelmatch from 'pixelmatch';
+
+
+let cv: typeof import('@u4/opencv4nodejs') | null = null;
+try {
+    cv = require('@u4/opencv4nodejs');
+} catch (e) {
+    console.warn('OpenCV not available, fallback engine will be used if needed.');
+}
 
 export class ClickByMatchingImageService {
     before() {
         browser.addCommand('clickByMatchingImage', async (
             referenceImagePath: string,
-            options?: { scales?: number[], confidence?: number }
+            options?: {
+                scales?: number[],
+                confidence?: number,
+                engine?: 'opencv' | 'fallback' | 'auto'
+            }
         ) => {
-            const scales = options?.scales ?? [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3];
             const confidence = options?.confidence ?? 0.7;
-            await this.clickByMatchingImage(referenceImagePath, scales, confidence);
+            const scales = options?.scales ?? [1.0, 0.9, 0.8, 0.7, 0.6, 0.5];
+            const engine = options?.engine ?? 'auto';
+
+            if (engine === 'opencv') {
+                if (!cv) throw new Error('OpenCV engine requested but not available.');
+                console.log('[ClickByMatchingImage] Using OpenCV engine.');
+                await this.clickByMatchingImageWithOpenCV(referenceImagePath, scales, confidence);
+            } else if (engine === 'fallback') {
+                console.log('[ClickByMatchingImage] Using fallback engine.');
+                await this.clickByMatchingImageFallback(referenceImagePath, confidence);
+            } else {
+                if (cv) {
+                    console.log('[ClickByMatchingImage] Using OpenCV engine (auto).');
+                    await this.clickByMatchingImageWithOpenCV(referenceImagePath, scales, confidence);
+                } else {
+                    console.log('[ClickByMatchingImage] Using fallback engine (auto).');
+                    await this.clickByMatchingImageFallback(referenceImagePath, confidence);
+                }
+            }
         });
     }
 
-    async clickByMatchingImage(referenceImagePath: string, scales: number[], confidence: number): Promise<void> {
-        if (!fs.existsSync(referenceImagePath)) {
-            throw new Error(`Reference image not found at path: ${referenceImagePath}`);
-        }
-
-        if (confidence < 0 || confidence > 1) {
-            throw new Error(`Confidence must be between 0 and 1. Received: ${confidence}`);
-        }
+    async clickByMatchingImageWithOpenCV(referenceImagePath: string, scales: number[], confidence: number): Promise<void> {
+        if (!cv) throw new Error('OpenCV not available.');
 
         const screenshotPath = './temp-screenshot.png';
-
         try {
+            if (!fs.existsSync(referenceImagePath)) {
+                throw new Error(`Reference image not found at path: ${referenceImagePath}`);
+            }
+
             const screenshotBase64 = await browser.takeScreenshot();
             const screenshotBuffer = Buffer.from(screenshotBase64, 'base64');
             fs.writeFileSync(screenshotPath, screenshotBuffer);
@@ -71,25 +98,80 @@ export class ClickByMatchingImageService {
             } else {
                 throw new Error(`No matching image found with confidence >= ${confidence}. Best match: ${bestMatch.maxVal.toFixed(2)}`);
             }
-        } catch (err: unknown) {
-            if (err instanceof Error) {
-                console.error(`Error in clickByMatchingImage: ${err.message}`);
-                throw err;
+        } finally {
+            if (fs.existsSync(screenshotPath)) {
+                fs.unlinkSync(screenshotPath);
+            }
+        }
+    }
+
+    async clickByMatchingImageFallback(referenceImagePath: string, confidence: number): Promise<void> {
+        const screenshotPath = './temp-screenshot.png';
+
+        try {
+            if (!fs.existsSync(referenceImagePath)) {
+                throw new Error(`Reference image not found: ${referenceImagePath}`);
+            }
+
+            const screenshotBase64 = await browser.takeScreenshot();
+            const screenshotBuffer = Buffer.from(screenshotBase64, 'base64');
+            fs.writeFileSync(screenshotPath, screenshotBuffer);
+
+            const screenshotImage = PNG.sync.read(screenshotBuffer);
+            const referenceImage = PNG.sync.read(fs.readFileSync(referenceImagePath));
+            const {width: refWidth, height: refHeight} = referenceImage;
+            const {width: screenWidth, height: screenHeight} = screenshotImage;
+            let bestMatch = {x: -1, y: -1, matchConfidence: 0};
+            let matchConfidence = 0;
+            const diffImage = new PNG({width: screenWidth, height: screenHeight});
+            const threshold = Math.floor((1 - confidence) * 255);
+            for (let y = 0; y <= screenHeight - refHeight; y++) {
+                for (let x = 0; x <= screenWidth - refWidth; x++) {
+                    const screenshotRegion = screenshotImage.data.slice(
+                        (y * screenWidth + x) * 4,
+                        (y * screenWidth + x + refWidth) * 4 + refHeight * screenWidth * 4
+                    );
+                    const referenceRegion = referenceImage.data;
+                    if (screenshotRegion.length !== referenceRegion.length) {
+                        continue; // Skip if sizes don't match
+                    }
+                    // Create a diff image to compare the two regions
+                    diffImage.data.fill(0); // Clear diff image
+                    diffImage.data.set(screenshotRegion, 0);
+                    diffImage.data.set(referenceRegion, 0);
+                    const diffCount = pixelmatch(
+                        screenshotImage.data, referenceImage.data,
+                        diffImage.data, screenWidth, screenHeight,
+                        {threshold: threshold / 255}
+                    );
+
+                    const currentConfidence = 1 - diffCount / (refWidth * refHeight);
+                    if (currentConfidence > matchConfidence) {
+                        matchConfidence = currentConfidence;
+                        bestMatch = {x, y, matchConfidence: currentConfidence};
+                    }
+                }
+            }
+            if (matchConfidence >= confidence) {
+                const centerX = bestMatch.x + Math.floor(refWidth / 2);
+                const centerY = bestMatch.y + Math.floor(refHeight / 2);
+
+                await browser.performActions([{
+                    type: 'pointer',
+                    id: 'mouse',
+                    parameters: {pointerType: 'mouse'},
+                    actions: [
+                        {type: 'pointerMove', duration: 0, x: centerX, y: centerY},
+                        {type: 'pointerDown', button: 0},
+                        {type: 'pointerUp', button: 0},
+                    ]
+                }]);
             } else {
-                console.error(`Unknown error in clickByMatchingImage: ${JSON.stringify(err)}`);
-                throw new Error(`Unknown error: ${JSON.stringify(err)}`);
+                throw new Error(`No match found. Best match confidence: ${matchConfidence.toFixed(2)}`);
             }
         } finally {
             if (fs.existsSync(screenshotPath)) {
-                try {
-                    fs.unlinkSync(screenshotPath);
-                } catch (cleanupErr: unknown) {
-                    if (cleanupErr instanceof Error) {
-                        console.warn(`Failed to delete temporary screenshot: ${cleanupErr.message}`);
-                    } else {
-                        console.warn(`Failed to delete temporary screenshot, unknown error: ${JSON.stringify(cleanupErr)}`);
-                    }
-                }
+                fs.unlinkSync(screenshotPath);
             }
         }
     }
