@@ -1,7 +1,9 @@
 import fs from 'fs';
 import {PNG} from 'pngjs';
 import pixelmatch from 'pixelmatch';
+import {createCanvas, loadImage} from 'canvas';
 
+import {Jimp} from 'jimp';
 
 let cv: typeof import('@u4/opencv4nodejs') | null = null;
 try {
@@ -85,16 +87,9 @@ export class ClickByMatchingImageService {
                 const centerX = bestMatch.maxLoc.x + Math.floor(bestMatch.refCols / 2);
                 const centerY = bestMatch.maxLoc.y + Math.floor(bestMatch.refRows / 2);
 
-                await browser.performActions([{
-                    type: 'pointer',
-                    id: 'mouse',
-                    parameters: {pointerType: 'mouse'},
-                    actions: [
-                        {type: 'pointerMove', duration: 0, x: centerX, y: centerY},
-                        {type: 'pointerDown', button: 0},
-                        {type: 'pointerUp', button: 0},
-                    ]
-                }]);
+                await annotateClickTarget(screenshotPath, './click-location-annotated-opencv.png', centerX, centerY, grayScreenshot.cols, grayScreenshot.rows);
+
+                await clickAt(centerX, centerY);
             } else {
                 throw new Error(`No matching image found with confidence >= ${confidence}. Best match: ${bestMatch.maxVal.toFixed(2)}`);
             }
@@ -107,6 +102,7 @@ export class ClickByMatchingImageService {
 
     async clickByMatchingImageFallback(referenceImagePath: string, confidence: number): Promise<void> {
         const screenshotPath = './temp-screenshot.png';
+        const annotatedPath = './click-location-annotated.png';
 
         try {
             if (!fs.existsSync(referenceImagePath)) {
@@ -114,65 +110,158 @@ export class ClickByMatchingImageService {
             }
 
             const screenshotBase64 = await browser.takeScreenshot();
-            const screenshotBuffer = Buffer.from(screenshotBase64, 'base64');
-            fs.writeFileSync(screenshotPath, screenshotBuffer);
+            fs.writeFileSync(screenshotPath, Buffer.from(screenshotBase64, 'base64'));
 
-            const screenshotImage = PNG.sync.read(screenshotBuffer);
-            const referenceImage = PNG.sync.read(fs.readFileSync(referenceImagePath));
-            const {width: refWidth, height: refHeight} = referenceImage;
-            const {width: screenWidth, height: screenHeight} = screenshotImage;
+
+            const [screenshotJimp, referenceJimp] = await Promise.all([
+                Jimp.read(screenshotPath),
+                Jimp.read(referenceImagePath),
+            ]);
+
+            const screenWidth = screenshotJimp.bitmap.width;
+            const screenHeight = screenshotJimp.bitmap.height;
+            const {width: viewportWidth, height: viewportHeight} = await browser.getWindowSize();
+            const scaleX = viewportWidth / screenWidth;
+            const scaleY = viewportHeight / screenHeight;
+
+            const refWidth = referenceJimp.bitmap.width;
+            const refHeight = referenceJimp.bitmap.height;
+
+            const stride = Math.max(1, Math.floor(Math.min(screenWidth, screenHeight) / 100));
+
+            const threshold = 0.1;
             let bestMatch = {x: -1, y: -1, matchConfidence: 0};
-            let matchConfidence = 0;
-            const diffImage = new PNG({width: screenWidth, height: screenHeight});
-            const threshold = Math.floor((1 - confidence) * 255);
-            for (let y = 0; y <= screenHeight - refHeight; y++) {
-                for (let x = 0; x <= screenWidth - refWidth; x++) {
-                    const screenshotRegion = screenshotImage.data.slice(
-                        (y * screenWidth + x) * 4,
-                        (y * screenWidth + x + refWidth) * 4 + refHeight * screenWidth * 4
-                    );
-                    const referenceRegion = referenceImage.data;
-                    if (screenshotRegion.length !== referenceRegion.length) {
-                        continue; // Skip if sizes don't match
-                    }
-                    // Create a diff image to compare the two regions
-                    diffImage.data.fill(0); // Clear diff image
-                    diffImage.data.set(screenshotRegion, 0);
-                    diffImage.data.set(referenceRegion, 0);
-                    const diffCount = pixelmatch(
-                        screenshotImage.data, referenceImage.data,
-                        diffImage.data, screenWidth, screenHeight,
-                        {threshold: threshold / 255}
-                    );
+            const referencePng = await imageToPng(referenceJimp);
+            const totalPixels = refWidth * refHeight;
 
-                    const currentConfidence = 1 - diffCount / (refWidth * refHeight);
-                    if (currentConfidence > matchConfidence) {
-                        matchConfidence = currentConfidence;
-                        bestMatch = {x, y, matchConfidence: currentConfidence};
+            for (let y = 0; y <= screenHeight - refHeight; y += stride) {
+                console.log(`Scanning row ${y} of ${screenHeight - refHeight}`);
+                for (let x = 0; x <= screenWidth - refWidth; x += stride) {
+                    const region = screenshotJimp.clone().crop({x, y, w: refWidth, h: refHeight});
+
+                    const regionPng = await imageToPng(region);
+
+                    const diffCount = pixelmatch(
+                        referencePng.data,
+                        regionPng.data,
+                        undefined,
+                        refWidth,
+                        refHeight,
+                        {threshold}
+                    );
+                    const matchConfidence = 1 - diffCount / totalPixels;
+
+                    if (matchConfidence > bestMatch.matchConfidence) {
+                        bestMatch = {x, y, matchConfidence};
                     }
                 }
             }
-            if (matchConfidence >= confidence) {
+
+            const refineRadius = stride;
+            for (let dy = -refineRadius; dy <= refineRadius; dy++) {
+                for (let dx = -refineRadius; dx <= refineRadius; dx++) {
+                    const rx = bestMatch.x + dx;
+                    const ry = bestMatch.y + dy;
+
+                    if (rx < 0 || ry < 0 || rx + refWidth > screenWidth || ry + refHeight > screenHeight) continue;
+
+                    const region = screenshotJimp.clone().crop({x: rx, y: ry, w: refWidth, h: refHeight});
+                    const regionPng = await imageToPng(region);
+                    const diffCount = pixelmatch(
+                        referencePng.data,
+                        regionPng.data,
+                        undefined,
+                        refWidth,
+                        refHeight,
+                        {threshold}
+                    );
+                    const matchConfidence = 1 - diffCount / totalPixels;
+
+                    if (matchConfidence > bestMatch.matchConfidence) {
+                        bestMatch = {x: rx, y: ry, matchConfidence};
+                    }
+                }
+            }
+
+            if (bestMatch.matchConfidence >= confidence) {
                 const centerX = bestMatch.x + Math.floor(refWidth / 2);
                 const centerY = bestMatch.y + Math.floor(refHeight / 2);
+                const {width, height} = await browser.getWindowSize();
+                const targetX = centerX * scaleX;
+                const targetY = centerY * scaleY;
+                if (targetX > width || targetY > height || targetX < 0 || targetY < 0) {
+                    throw new Error(`Adjusted click target (${targetX}, ${targetY}) is out of bounds.`);
+                }
 
-                await browser.performActions([{
-                    type: 'pointer',
-                    id: 'mouse',
-                    parameters: {pointerType: 'mouse'},
-                    actions: [
-                        {type: 'pointerMove', duration: 0, x: centerX, y: centerY},
-                        {type: 'pointerDown', button: 0},
-                        {type: 'pointerUp', button: 0},
-                    ]
-                }]);
+                await annotateClickTarget(screenshotPath, annotatedPath, centerX, centerY, screenWidth, screenHeight);
+
+
+                await clickAt(targetX, targetY);
+
             } else {
-                throw new Error(`No match found. Best match confidence: ${matchConfidence.toFixed(2)}`);
+                throw new Error(`No match found. Best match confidence: ${bestMatch.matchConfidence.toFixed(2)}`);
             }
+
         } finally {
             if (fs.existsSync(screenshotPath)) {
                 fs.unlinkSync(screenshotPath);
             }
         }
     }
+}
+
+async function annotateClickTarget(
+    screenshotPath: string,
+    annotatedPath: string,
+    centerX: number,
+    centerY: number,
+    screenWidth: number,
+    screenHeight: number
+): Promise<void> {
+    const canvas = createCanvas(screenWidth, screenHeight);
+    const ctx = canvas.getContext('2d');
+    const image = await loadImage(screenshotPath);
+    ctx.drawImage(image, 0, 0);
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, 10, 0, 2 * Math.PI);
+    ctx.strokeStyle = 'red';
+    ctx.lineWidth = 5;
+    ctx.stroke();
+
+    const out = fs.createWriteStream(annotatedPath);
+    const stream = canvas.createPNGStream();
+    stream.pipe(out);
+
+    await new Promise(resolve => stream.on('end', resolve));
+}
+
+
+async function imageToPng(image: any): Promise<PNG> {
+    const {bitmap} = image;
+    const png = new PNG({width: bitmap.width, height: bitmap.height});
+    png.data = Buffer.from(bitmap.data); // make sure it's a copy
+    return png;
+}
+
+async function clickAt(x: number, y: number): Promise<void> {
+    const dpr = await browser.execute(() => window.devicePixelRatio);
+    const {width, height} = await browser.getWindowSize();
+
+    const adjustedX = Math.round(x / dpr);
+    const adjustedY = Math.round(y / dpr);
+
+    if (adjustedX < 0 || adjustedY < 0 || adjustedX > width || adjustedY > height) {
+        throw new Error(`Adjusted click target (${adjustedX}, ${adjustedY}) is out of bounds.`);
+    }
+
+    console.log({x, y, adjustedX, adjustedY, width, height, dpr});
+
+    await browser.execute(() => window.scrollTo(0, 0));
+
+    await browser.action('pointer', {parameters: {pointerType: 'mouse'}})
+        .move({x: adjustedX, y: adjustedY, origin: 'viewport'})
+        .down({button: 'left'})
+        .pause(10)
+        .up({button: 'left'})
+        .perform();
 }
