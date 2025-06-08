@@ -1,7 +1,6 @@
 import fs from 'fs';
 import {PNG} from 'pngjs';
 import pixelmatch from 'pixelmatch';
-import {createCanvas, loadImage} from 'canvas';
 
 import {Jimp} from 'jimp';
 
@@ -87,8 +86,6 @@ export class ClickByMatchingImageService {
                 const centerX = bestMatch.maxLoc.x + Math.floor(bestMatch.refCols / 2);
                 const centerY = bestMatch.maxLoc.y + Math.floor(bestMatch.refRows / 2);
 
-                await annotateClickTarget(screenshotPath, './click-location-annotated-opencv.png', centerX, centerY, grayScreenshot.cols, grayScreenshot.rows);
-
                 await clickAt(centerX, centerY);
             } else {
                 throw new Error(`No matching image found with confidence >= ${confidence}. Best match: ${bestMatch.maxVal.toFixed(2)}`);
@@ -102,7 +99,6 @@ export class ClickByMatchingImageService {
 
     async clickByMatchingImageFallback(referenceImagePath: string, confidence: number): Promise<void> {
         const screenshotPath = './temp-screenshot.png';
-        const annotatedPath = './click-location-annotated.png';
 
         try {
             if (!fs.existsSync(referenceImagePath)) {
@@ -120,9 +116,6 @@ export class ClickByMatchingImageService {
 
             const screenWidth = screenshotJimp.bitmap.width;
             const screenHeight = screenshotJimp.bitmap.height;
-            const {width: viewportWidth, height: viewportHeight} = await browser.getWindowSize();
-            const scaleX = viewportWidth / screenWidth;
-            const scaleY = viewportHeight / screenHeight;
 
             const refWidth = referenceJimp.bitmap.width;
             const refHeight = referenceJimp.bitmap.height;
@@ -135,7 +128,6 @@ export class ClickByMatchingImageService {
             const totalPixels = refWidth * refHeight;
 
             for (let y = 0; y <= screenHeight - refHeight; y += stride) {
-                console.log(`Scanning row ${y} of ${screenHeight - refHeight}`);
                 for (let x = 0; x <= screenWidth - refWidth; x += stride) {
                     const region = screenshotJimp.clone().crop({x, y, w: refWidth, h: refHeight});
 
@@ -186,18 +178,7 @@ export class ClickByMatchingImageService {
             if (bestMatch.matchConfidence >= confidence) {
                 const centerX = bestMatch.x + Math.floor(refWidth / 2);
                 const centerY = bestMatch.y + Math.floor(refHeight / 2);
-                const {width, height} = await browser.getWindowSize();
-                const targetX = centerX * scaleX;
-                const targetY = centerY * scaleY;
-                if (targetX > width || targetY > height || targetX < 0 || targetY < 0) {
-                    throw new Error(`Adjusted click target (${targetX}, ${targetY}) is out of bounds.`);
-                }
-
-                await annotateClickTarget(screenshotPath, annotatedPath, centerX, centerY, screenWidth, screenHeight);
-
-
-                await clickAt(targetX, targetY);
-
+                await clickAt(centerX, centerY);
             } else {
                 throw new Error(`No match found. Best match confidence: ${bestMatch.matchConfidence.toFixed(2)}`);
             }
@@ -210,36 +191,10 @@ export class ClickByMatchingImageService {
     }
 }
 
-async function annotateClickTarget(
-    screenshotPath: string,
-    annotatedPath: string,
-    centerX: number,
-    centerY: number,
-    screenWidth: number,
-    screenHeight: number
-): Promise<void> {
-    const canvas = createCanvas(screenWidth, screenHeight);
-    const ctx = canvas.getContext('2d');
-    const image = await loadImage(screenshotPath);
-    ctx.drawImage(image, 0, 0);
-    ctx.beginPath();
-    ctx.arc(centerX, centerY, 10, 0, 2 * Math.PI);
-    ctx.strokeStyle = 'red';
-    ctx.lineWidth = 5;
-    ctx.stroke();
-
-    const out = fs.createWriteStream(annotatedPath);
-    const stream = canvas.createPNGStream();
-    stream.pipe(out);
-
-    await new Promise(resolve => stream.on('end', resolve));
-}
-
-
 async function imageToPng(image: any): Promise<PNG> {
     const {bitmap} = image;
     const png = new PNG({width: bitmap.width, height: bitmap.height});
-    png.data = Buffer.from(bitmap.data); // make sure it's a copy
+    png.data = Buffer.from(bitmap.data);
     return png;
 }
 
