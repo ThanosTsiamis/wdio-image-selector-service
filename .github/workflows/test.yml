@@ -28,13 +28,14 @@ jobs:
 
       - name: 🧰 Manually install OpenCV to ensure that tests will run
         run: |
-          brew install opencv@4
+          brew install opencv@4 cmake pkg-config
 
       - name: 📦 Export OpenCV Environment Variables
         run: |
-          echo "OPENCV_INCLUDE_DIR=$(brew --prefix opencv)/include/opencv4" >> $GITHUB_ENV
-          echo "OPENCV_LIB_DIR=$(brew --prefix opencv)/lib" >> $GITHUB_ENV
-          echo "OPENCV_BIN_DIR=$(brew --prefix opencv)/bin" >> $GITHUB_ENV
+          echo "OPENCV4NODEJS_DISABLE_AUTOBUILD=true" >> $GITHUB_ENV
+          echo "OPENCV4NODEJS_INCLUDE_DIR=$(brew --prefix opencv@4)/include/opencv4" >> $GITHUB_ENV
+          echo "OPENCV4NODEJS_LIB_DIR=$(brew --prefix opencv@4)/lib"     >> $GITHUB_ENV
+          echo "OPENCV4NODEJS_BIN_DIR=$(brew --prefix opencv@4)/bin"     >> $GITHUB_ENV
 
       - name: ⬇️ Install Dependencies including scripts required for opencv
         run: pnpm install --ignore-scripts=false
