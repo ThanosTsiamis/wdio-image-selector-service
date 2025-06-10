@@ -43,9 +43,12 @@ jobs:
       - name: 🏗️ Build
         run: pnpm run build
 
-      - name: 🚀 Serve Canvas App in Background
-        run: |
-          pnpm run serve:example 
+      - name: 🚀 Build Example
+        run: pnpm run build:example
+
+      - name: Serve Example
+        run: pnpm run serve:example &
+          npx wait-on http://localhost:3000
 
       - name: 🧪 Run WebdriverIO Tests
         uses: GabrielBB/xvfb-action@v1
