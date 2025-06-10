@@ -36,8 +36,8 @@ jobs:
           echo "OPENCV_LIB_DIR=$(brew --prefix opencv)/lib" >> $GITHUB_ENV
           echo "OPENCV_BIN_DIR=$(brew --prefix opencv)/bin" >> $GITHUB_ENV
 
-      - name: ⬇️ Install Dependencies
-        run: pnpm install
+      - name: ⬇️ Install Dependencies including scripts required for opencv
+        run: pnpm install --ignore-scripts=false
 
       - name: 🏗️ Build
         run: pnpm run build
