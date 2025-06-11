@@ -43,6 +43,9 @@ jobs:
       - name: 🏗️ Build
         run: pnpm run build
 
+      - name: Cd and Install dependencies to Example Directory
+        run: cd example && pnpm install --ignore-scripts=false
+
       - name: 🚀 Build Example
         run: pnpm run build:example
 
